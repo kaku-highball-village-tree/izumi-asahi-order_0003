@@ -68,6 +68,7 @@ def show_error_message_box(
 def run_quantity_change_highlighter_cmd(
     pszInputFileFullPath: str,
     pszMode: str = "",
+    pszPreparedOrder: str | None = None,
 ) -> tuple[bool, str]:
     """同じフォルダーのCmdプログラムをsubprocess.run()で実行します。
 
@@ -102,6 +103,11 @@ def run_quantity_change_highlighter_cmd(
     if pszMode != "":
         listCommandArguments.append(pszMode)
     listCommandArguments.append(pszInputFileFullPath)
+    dictEnvironment = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    if pszPreparedOrder is not None:
+        dictEnvironment["ASAHI_ORDER_HIGHLIGHTER_PREPARED_ORDER"] = pszPreparedOrder
+    else:
+        dictEnvironment.pop("ASAHI_ORDER_HIGHLIGHTER_PREPARED_ORDER", None)
     try:
         objCompletedProcess: subprocess.CompletedProcess[str] = subprocess.run(
             listCommandArguments,
@@ -109,7 +115,7 @@ def run_quantity_change_highlighter_cmd(
             capture_output=True,
             text=True,
             encoding="utf-8",
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            env=dictEnvironment,
         )
     except Exception as objException:
         return (
@@ -389,6 +395,15 @@ def window_proc(
                 show_error_message_box(pszPrepareMessage, WINDOW_TITLE)
                 return 0
 
+            listPreparedOrders = [line.removeprefix("Prepared order: ").strip()
+                                  for line in pszPrepareMessage.splitlines()
+                                  if line.startswith("Prepared order: ")]
+            if (len(listPreparedOrders) != 1 or len(listPreparedOrders[0]) != 64
+                    or any(char not in "0123456789abcdef" for char in listPreparedOrders[0])):
+                show_error_message_box("編集前の注文識別情報を確認できません。処理を中止します。", WINDOW_TITLE)
+                return 0
+            pszPreparedOrder = listPreparedOrders[0]
+
             bIsExcelClosed, pszExcelMessage = open_excel_file_and_wait(
                 pszDroppedFilePath
             )
@@ -397,7 +412,7 @@ def window_proc(
                 return 0
 
             bIsSuccess, pszMessage = run_quantity_change_highlighter_cmd(
-                pszDroppedFilePath
+                pszDroppedFilePath, pszPreparedOrder=pszPreparedOrder
             )
             if not bIsSuccess:
                 show_error_message_box(pszMessage, WINDOW_TITLE)
