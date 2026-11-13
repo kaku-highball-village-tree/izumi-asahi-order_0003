@@ -12,6 +12,7 @@
 
 import csv
 import io
+import hashlib
 import json
 import os
 import re
@@ -20,7 +21,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -36,10 +37,14 @@ EXPECTED_HEADERS = (
     "仕様", "伝票原価", "伝票売価", "値入", "売価", "単位",
 )
 WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
-HISTORY_HEADERS = (
+LEGACY_HISTORY_HEADERS = (
     "formatVersion", "apexProductCode", "deliveryDate", "storeCode", "quantity", "isRed",
 )
-FORMAT_VERSION = "1"
+HISTORY_HEADERS = (
+    "formatVersion", "apexProductCode", "deliveryDate", "storeCode", "storeName", "quantity", "isRed",
+)
+FORMAT_VERSION = "2"
+PREPARED_ORDER_ENVIRONMENT_VARIABLE = "ASAHI_ORDER_HIGHLIGHTER_PREPARED_ORDER"
 RED_FONT_COLOR = "FFFF0000"
 MAX_HISTORY_NUMBER = 9999
 
@@ -54,6 +59,7 @@ class OrderRow:
     quantity: object
     is_red: bool
     quantity_cell: Cell | None = None
+    store_name: str = ""
 
     @property
     def key(self) -> tuple[date, str]:
@@ -273,6 +279,7 @@ def read_excel_rows(objWorksheet: Worksheet) -> list[OrderRow]:
             listOrderRows.append(OrderRow(
                 pszProductCode, objMonday + timedelta(days=iDay), pszStoreCode,
                 objCell.value, is_red_cell(objCell), objCell,
+                normalize_text_cell(objWorksheet.cell(2, iColumn).value),
             ))
     return listOrderRows
 
@@ -294,30 +301,63 @@ def build_history_patterns(pszExcelBaseName: str) -> tuple[re.Pattern[str], re.P
 # find_history_files
 #
 ###############################################################
+def history_root(objExcelPath: Path) -> Path:
+    return objExcelPath.with_name(objExcelPath.stem + "_highlighter_history")
+
+
+def order_token(listRows: list[OrderRow]) -> str:
+    """列順・数量・商品名には依存せず、注文の3条件を識別します。"""
+    objIdentity = {
+        "products": sorted({row.product_code for row in listRows}),
+        "dates": sorted({row.delivery_date.isoformat() for row in listRows}),
+        "stores": sorted({(row.store_code, row.store_name) for row in listRows}),
+    }
+    return hashlib.sha256(json.dumps(objIdentity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def order_history_directory(objExcelPath: Path, listRows: list[OrderRow]) -> Path:
+    # 品番にWindowsのファイル名禁止文字があっても、識別は元の内容で行います。
+    pszCode = re.sub(r"[^A-Za-z0-9_-]", "_", listRows[0].product_code)[:24]
+    listDates = sorted({row.delivery_date for row in listRows})
+    pszName = (pszCode + "_" + listDates[0].strftime("%Y%m%d") + "_"
+               + listDates[-1].strftime("%Y%m%d") + "_" + order_token(listRows)[:16])
+    return history_root(objExcelPath) / pszName
+
+
 def find_history_files(
     pszInputFileFullPath: str,
+    listRows: list[OrderRow] | None = None,
+    objDirectory: Path | None = None,
 ) -> tuple[dict[int, Path], dict[int, Path]]:
-    """Excelと同じフォルダーから、対応する履歴とlatestを検索します。"""
-    objExcelPath: Path = Path(pszInputFileFullPath)
+    """内容で選んだ注文フォルダーを検索。旧履歴検索時のみ保存先を明示。"""
+    objExcelPath = Path(pszInputFileFullPath)
+    if objDirectory is None:
+        if listRows is None:
+            objWorkbook = load_excel(str(objExcelPath))
+            try:
+                listRows = read_excel_rows(find_target_worksheet(objWorkbook))
+            finally:
+                objWorkbook.close()
+        objDirectory = order_history_directory(objExcelPath, listRows)
     objHistoryPattern, objLatestPattern = build_history_patterns(objExcelPath.stem)
-    dictHistoryFiles: dict[int, Path] = {}
-    dictLatestFiles: dict[int, Path] = {}
-
-    for objPath in objExcelPath.parent.iterdir():
+    dictHistoryFiles, dictLatestFiles = {}, {}
+    if not objDirectory.exists():
+        return dictHistoryFiles, dictLatestFiles
+    for objPath in objDirectory.iterdir():
         if not objPath.is_file():
             continue
-        objHistoryMatch = objHistoryPattern.fullmatch(objPath.name)
-        if objHistoryMatch is not None:
-            dictHistoryFiles[int(objHistoryMatch.group(1))] = objPath
-            continue
+        objMatch = objHistoryPattern.fullmatch(objPath.name)
         objLatestMatch = objLatestPattern.fullmatch(objPath.name)
-        if objLatestMatch is not None:
+        if objMatch:
+            dictHistoryFiles[int(objMatch.group(1))] = objPath
+        elif objLatestMatch:
             dictLatestFiles[int(objLatestMatch.group(1))] = objPath
     return dictHistoryFiles, dictLatestFiles
 
 
 def validate_history_state(
     dictHistoryFiles: dict[int, Path], dictLatestFiles: dict[int, Path],
+    bAllowLegacy: bool = False,
 ) -> tuple[bool, Path | None, int]:
     """欠番・旧形式・数量や赤字履歴の破損も検証し、自動修復しません。"""
     if not dictHistoryFiles and not dictLatestFiles:
@@ -334,7 +374,7 @@ def validate_history_state(
         raise ValueError("同じ番号の履歴TSVとlatest TSVの内容が異なります。")
     listPreviousRows = None
     for _, objHistoryPath in sorted(dictHistoryFiles.items()):
-        listRows = load_previous_tsv(objHistoryPath)
+        listRows = load_previous_tsv(objHistoryPath, bAllowLegacy)
         if listPreviousRows is not None:
             validate_matching_orders(listRows, listPreviousRows)
             dictPrevious = {row.key: row for row in listPreviousRows}
@@ -349,17 +389,26 @@ def validate_history_state(
     return False, objLatestPath, iMaximum + 1
 
 
-def load_previous_tsv(objTsvPath: Path) -> list[OrderRow]:
+def load_previous_tsv(objTsvPath: Path, bAllowLegacy: bool = False) -> list[OrderRow]:
     with objTsvPath.open("r", encoding="utf-8-sig", newline="") as objFile:
         listRows = list(csv.reader(objFile, delimiter="\t", strict=True))
-    if not listRows or tuple(listRows[0]) != HISTORY_HEADERS:
+    bLegacy = bool(listRows and tuple(listRows[0]) == LEGACY_HISTORY_HEADERS and bAllowLegacy)
+    if not listRows or (tuple(listRows[0]) != HISTORY_HEADERS and not bLegacy):
         raise ValueError("履歴の形式が対応していません。File = " + str(objTsvPath))
+    tupleHeaders = LEGACY_HISTORY_HEADERS if bLegacy else HISTORY_HEADERS
+    pszVersion = "1" if bLegacy else FORMAT_VERSION
     listOrderRows = []
     setKeys = set()
     for listRow in listRows[1:]:
-        if len(listRow) != len(HISTORY_HEADERS) or listRow[0] != FORMAT_VERSION:
+        if len(listRow) != len(tupleHeaders) or listRow[0] != pszVersion:
             raise ValueError("履歴の列数またはバージョンが不正です。File = " + str(objTsvPath))
-        _, pszProductCode, pszDate, pszStoreCode, pszQuantity, pszIsRed = listRow
+        if bLegacy:
+            _, pszProductCode, pszDate, pszStoreCode, pszQuantity, pszIsRed = listRow
+            pszStoreName = ""
+        else:
+            _, pszProductCode, pszDate, pszStoreCode, pszStoreName, pszQuantity, pszIsRed = listRow
+            if not pszStoreName.strip():
+                raise ValueError("履歴の店舗名が空欄です。")
         if not pszProductCode.strip() or pszIsRed not in ("0", "1"):
             raise ValueError("履歴の商品コードまたは赤字情報が不正です。")
         try:
@@ -367,7 +416,7 @@ def load_previous_tsv(objTsvPath: Path) -> list[OrderRow]:
         except ValueError as objException:
             raise ValueError("履歴の納品日が不正です。") from objException
         normalize_quantity_for_comparison(pszQuantity)
-        objRow = OrderRow(pszProductCode, objDate, normalize_store_code(pszStoreCode), pszQuantity, pszIsRed == "1")
+        objRow = OrderRow(pszProductCode, objDate, normalize_store_code(pszStoreCode), pszQuantity, pszIsRed == "1", store_name=pszStoreName.strip())
         if objRow.key in setKeys:
             raise ValueError("履歴の日付・店舗コードが重複しています。")
         setKeys.add(objRow.key)
@@ -381,16 +430,14 @@ def load_previous_tsv(objTsvPath: Path) -> list[OrderRow]:
         raise ValueError("履歴の納品日は月～日の連続した7日間が必要です。")
     if len(listOrderRows) != 7 * len(setStores):
         raise ValueError("履歴に不足している日付・店舗の数量があります。")
+    if len({(row.store_code, row.store_name) for row in listOrderRows}) != len(setStores):
+        raise ValueError("履歴内で同じ店舗コードに複数の店舗名があります。")
     return listOrderRows
 
 
 def validate_matching_orders(listCurrentRows: list[OrderRow], listPreviousRows: list[OrderRow]) -> None:
-    if ({row.product_code for row in listCurrentRows} != {row.product_code for row in listPreviousRows}
-            or {row.key for row in listCurrentRows} != {row.key for row in listPreviousRows}):
-        raise ValueError(
-            "商品・対象日付・店舗構成が履歴と一致しません。"
-            "別の入力ファイル名で新しい履歴を開始してください。"
-        )
+    if order_token(listCurrentRows) != order_token(listPreviousRows):
+        raise ValueError("商品・対象日付・店舗コードと店舗名が選択した注文の履歴と一致しません。")
 
 
 def compare_quantity(listCurrentRows: list[OrderRow], listPreviousRows: list[OrderRow]) -> list[Cell]:
@@ -422,7 +469,7 @@ def serialize_tsv(listOrderRows: list[OrderRow]) -> str:
     objWriter.writerow(HISTORY_HEADERS)
     for row in sorted(listOrderRows, key=lambda row: (row.delivery_date, int(row.store_code))):
         objWriter.writerow([
-            FORMAT_VERSION, row.product_code, row.delivery_date.isoformat(), row.store_code,
+            FORMAT_VERSION, row.product_code, row.delivery_date.isoformat(), row.store_code, row.store_name,
             normalize_text_cell(row.quantity), "1" if row.is_red else "0",
         ])
     return objBuffer.getvalue()
@@ -431,17 +478,255 @@ def serialize_tsv(listOrderRows: list[OrderRow]) -> str:
 def build_snapshot_paths(
     pszInputFileFullPath: str,
     iHistoryNumber: int,
+    listRows: list[OrderRow],
 ) -> tuple[Path, Path]:
     """指定履歴番号の履歴TSVとlatest TSVの保存先を返します。"""
     objExcelPath: Path = Path(pszInputFileFullPath)
     pszNumber: str = f"{iHistoryNumber:04d}"
-    objHistoryPath: Path = objExcelPath.with_name(
-        objExcelPath.stem + "_" + pszNumber + ".tsv"
-    )
-    objLatestPath: Path = objExcelPath.with_name(
-        objExcelPath.stem + "_" + pszNumber + "_latest.tsv"
-    )
+    objDirectory = order_history_directory(objExcelPath, listRows)
+    objHistoryPath = objDirectory / (objExcelPath.stem + "_" + pszNumber + ".tsv")
+    objLatestPath = objDirectory / (objExcelPath.stem + "_" + pszNumber + "_latest.tsv")
     return objHistoryPath, objLatestPath
+
+
+def prepared_order_path(objExcelPath: Path) -> Path:
+    return objExcelPath.with_name(objExcelPath.stem + "_highlighter_prepared.json")
+
+
+def atomic_json(objPath: Path, objData: dict) -> None:
+    iDescriptor, pszTemporary = tempfile.mkstemp(prefix="." + objPath.name, dir=objPath.parent)
+    try:
+        with os.fdopen(iDescriptor, "w", encoding="utf-8") as objFile:
+            json.dump(objData, objFile, ensure_ascii=False, indent=2)
+            objFile.flush()
+            os.fsync(objFile.fileno())
+        os.replace(pszTemporary, objPath)
+    finally:
+        Path(pszTemporary).unlink(missing_ok=True)
+
+
+def save_prepared_order(objExcelPath: Path, listRows: list[OrderRow]) -> None:
+    atomic_json(prepared_order_path(objExcelPath), {"orderToken": order_token(listRows)})
+
+
+def validate_prepared_order(objExcelPath: Path, listRows: list[OrderRow]) -> None:
+    """編集後に別注文へ切り替わっても、別注文の既存履歴とは比較しません。"""
+    objPath = prepared_order_path(objExcelPath)
+    if not objPath.exists():
+        raise ValueError("編集前の準備記録がありません。編集前に--prepareを実行してください。")
+    pszExpected = json.loads(objPath.read_text(encoding="utf-8")).get("orderToken")
+    pszSessionExpected = os.environ.get(PREPARED_ORDER_ENVIRONMENT_VARIABLE)
+    if (pszExpected != order_token(listRows)
+            or (pszSessionExpected is not None and pszSessionExpected != pszExpected)):
+        raise ValueError(
+            "編集前準備後に注文の識別情報が変わりました。比較を中止します。"
+            "数量以外の変更を確認し、対象注文の編集前準備からやり直してください。"
+        )
+
+
+def migration_record_path(objExcelPath: Path) -> Path:
+    return history_root(objExcelPath) / "_legacy_migration.json"
+
+
+def check_migration_record(objExcelPath: Path) -> dict | None:
+    objPath = migration_record_path(objExcelPath)
+    if not objPath.exists():
+        return None
+    try:
+        objRecord = json.loads(objPath.read_text(encoding="utf-8"))
+    except (ValueError, OSError) as objException:
+        raise ValueError("旧履歴の移行記録を確認できません。記録: " + str(objPath)) from objException
+    if objRecord.get("state") != "completed":
+        raise ValueError(
+            "旧履歴の移行が未完了です。自動復旧は行いません。"
+            "\n移行記録: " + str(objPath)
+            + "\n復旧案内: " + str(objRecord.get("recoveryFile", "移行用フォルダー内のrecovery.txt"))
+        )
+    return objRecord
+
+
+def legacy_fingerprint(listRows: list[OrderRow]) -> tuple:
+    """旧形式とバックアップの数量・空欄・累積赤字を名前以外で照合します。"""
+    return tuple(sorted(
+        (row.product_code, row.delivery_date.isoformat(), row.store_code,
+         normalize_quantity_for_comparison(row.quantity),
+         normalize_text_cell(row.quantity) == "", row.is_red)
+        for row in listRows
+    ))
+
+
+def reconstruct_legacy_orders(
+    objExcelPath: Path, dictHistories: dict[int, Path], dictSourceBytes: dict[Path, bytes],
+) -> dict[int, list[OrderRow]]:
+    """各保存時のバックアップExcelから、確認できる店舗名だけを復元します。
+
+    初回は編集前Excelそのものと照合。2回目以降はバックアップ内の旧latestを
+    前回履歴と照合し、そのExcelに旧版と同じ数量/赤字処理を適用した結果で確認。
+    複数の店舗名構成が候補になれば、推測で一つを選ばず停止します。
+    """
+    dictOldRows = {i: load_previous_tsv(path, True) for i, path in dictHistories.items()}
+    dictCandidates = {i: {} for i in dictHistories}
+    objBackupRoot = objExcelPath.with_name(objExcelPath.stem + "_highlighter_backups")
+    listBackupExcels = ([path / objExcelPath.name for path in objBackupRoot.iterdir()
+                         if path.is_dir() and (path / objExcelPath.name).is_file()]
+                        if objBackupRoot.is_dir() else [])
+    for objBackupExcel in sorted(listBackupExcels):
+        objWorkbook = None
+        try:
+            objWorkbook = load_excel(str(objBackupExcel))
+            listBackupRows = read_excel_rows(find_target_worksheet(objWorkbook))
+            dictBackup = {row.key: row for row in listBackupRows}
+            for iNumber, listOldRows in dictOldRows.items():
+                if iNumber == 1:
+                    _, objLatestPattern = build_history_patterns(objExcelPath.stem)
+                    if any(objLatestPattern.fullmatch(path.name) for path in objBackupExcel.parent.iterdir()):
+                        continue
+                    listPredicted = listBackupRows
+                else:
+                    objPriorPath = objBackupExcel.parent / (
+                        objExcelPath.stem + f"_{iNumber - 1:04d}_latest.tsv"
+                    )
+                    if (not objPriorPath.is_file()
+                            or objPriorPath.read_bytes() != dictSourceBytes[dictHistories[iNumber - 1]]):
+                        continue
+                    listPredicted = []
+                    for previous in dictOldRows[iNumber - 1]:
+                        current = dictBackup.get(previous.key)
+                        if current is None or current.product_code != previous.product_code:
+                            break
+                        bChanged = (normalize_quantity_for_comparison(current.quantity)
+                                    != normalize_quantity_for_comparison(previous.quantity))
+                        listPredicted.append(replace(
+                            current,
+                            quantity=0 if bChanged and normalize_text_cell(current.quantity) == "" else current.quantity,
+                            is_red=current.is_red or previous.is_red or bChanged,
+                        ))
+                if legacy_fingerprint(listPredicted) != legacy_fingerprint(listOldRows):
+                    continue
+                listEnriched = [replace(row, store_name=dictBackup[row.key].store_name) for row in listOldRows]
+                dictCandidates[iNumber][order_token(listEnriched)] = listEnriched
+        except (ValueError, OSError, KeyError):
+            # 壊れた/無関係なバックアップを根拠にはしません。
+            continue
+        finally:
+            if objWorkbook is not None:
+                objWorkbook.close()
+    dictResult = {}
+    for iNumber, dictOrders in dictCandidates.items():
+        if len(dictOrders) != 1:
+            raise ValueError(
+                "旧履歴の店舗名をバックアップExcelから一意に確認できません。推測で移行しません。"
+                + "\n対象履歴: " + str(dictHistories[iNumber])
+                + "\nバックアップフォルダー: " + str(objBackupRoot)
+                + "\n旧履歴と対応するバックアップを確認してください。"
+            )
+        dictResult[iNumber] = next(iter(dictOrders.values()))
+    return dictResult
+
+
+def migrate_legacy_history(objExcelPath: Path) -> None:
+    """旧保存先から注文別フォルダーへ移行。失敗時は記録を残し手動復旧。"""
+    dictOldHistories, dictOldLatest = find_history_files(str(objExcelPath), objDirectory=objExcelPath.parent)
+    objRecord = check_migration_record(objExcelPath)
+    if objRecord is not None:
+        if dictOldHistories or dictOldLatest:
+            raise ValueError("移行済み履歴と旧保存場所の履歴が競合しています。自動で混ぜません。")
+        for entry in objRecord["archiveFiles"] + objRecord["historyFiles"]:
+            objPath = history_root(objExcelPath) / entry["path"]
+            if not objPath.is_file() or hashlib.sha256(objPath.read_bytes()).hexdigest() != entry["sha256"]:
+                raise ValueError("移行済みの旧履歴または移行先履歴が変更・欠損しています。Path = " + str(objPath))
+        return
+    if not dictOldHistories and not dictOldLatest:
+        return
+    validate_history_state(dictOldHistories, dictOldLatest, bAllowLegacy=True)
+    dictSourceBytes = {path: path.read_bytes() for path in [*dictOldHistories.values(), *dictOldLatest.values()]}
+    # v1以外を旧保存場所から黙って取り込まないよう、形式も明示確認します。
+    for objPath in dictSourceBytes:
+        with objPath.open("r", encoding="utf-8-sig", newline="") as objFile:
+            if tuple(next(csv.reader(objFile, delimiter="\t"))) != LEGACY_HISTORY_HEADERS:
+                raise ValueError("旧保存場所に想定外の履歴形式があります。自動で移行しません。")
+    dictRows = reconstruct_legacy_orders(objExcelPath, dictOldHistories, dictSourceBytes)
+    dictGroups = {}
+    for _, listRows in sorted(dictRows.items()):
+        dictGroups.setdefault(order_token(listRows), []).append(listRows)
+    dictOutputs = {}
+    listHistoricalPaths = []
+    setDirectories = set()
+    for listSnapshots in dictGroups.values():
+        objDirectory = order_history_directory(objExcelPath, listSnapshots[0])
+        if objDirectory in setDirectories:
+            raise ValueError("移行先の注文識別子が競合しています。自動で混ぜません。")
+        setDirectories.add(objDirectory)
+        if objDirectory.exists() and any(objDirectory.iterdir()):
+            raise ValueError("旧履歴と移行先の履歴が競合しています。自動で混ぜません。Path = " + str(objDirectory))
+        for iNumber, listRows in enumerate(listSnapshots, 1):
+            objHistory, objLatest = build_snapshot_paths(str(objExcelPath), iNumber, listRows)
+            dictOutputs[objHistory] = serialize_tsv(listRows).encode("utf-8")
+            listHistoricalPaths.append(objHistory)
+        dictOutputs[objLatest] = dictOutputs[objHistory]
+
+    objRoot = history_root(objExcelPath)
+    objRoot.mkdir(parents=True, exist_ok=True)
+    objStaging = objRoot / ("_migration_" + uuid.uuid4().hex)
+    objStaging.mkdir()
+    objArchive = objRoot / "_legacy_originals"
+    if objArchive.exists():
+        raise ValueError("旧履歴保管先が既に存在します。競合を確認してください。Path = " + str(objArchive))
+    # すべての一時履歴を検証してから、未完了記録と正式反映に進みます。
+    dictStaged = {}
+    for iIndex, (objTarget, bytesContent) in enumerate(dictOutputs.items()):
+        objTemp = objStaging / str(iIndex)
+        write_exclusive_bytes(objTemp, bytesContent)
+        if serialize_tsv(load_previous_tsv(objTemp)).encode("utf-8") != bytesContent:
+            raise ValueError("移行用一時履歴の検証に失敗しました。")
+        dictStaged[objTarget] = objTemp
+    for objSource, bytesContent in dictSourceBytes.items():
+        if objSource.read_bytes() != bytesContent:
+            raise ValueError("確認中に旧履歴が更新されました。移行を中止します。")
+    objRecovery = objStaging / "recovery.txt"
+    pszRecovery = (
+        "旧履歴の移行が未完了の場合、自動復旧は行いません。入力Excelは移行では変更しません。\n"
+        "1. Highlighterと対象Excelを閉じ、現在の履歴と移行記録を別の場所へ保全します。\n"
+        "2. 旧履歴の保管先にあるファイルを、入力Excelと同じ場所へ戻します。\n"
+        + str(objArchive) + " -> " + str(objExcelPath.parent) + "\n"
+        "3. 移行記録のoutputsに記載された今回の移行先ファイルだけを削除します。\n"
+        "4. 元の履歴とlatestの内容・番号を確認し、旧履歴保管先を退避します。\n"
+        "5. 復旧完了後に移行記録と、残っていればロックを削除し、再実行します。\n"
+        + "移行記録: " + str(migration_record_path(objExcelPath)) + "\n"
+    )
+    write_exclusive_bytes(objRecovery, pszRecovery.encode("utf-8"))
+    objRecord = {
+        "state": "pending", "recoveryFile": str(objRecovery),
+        "outputs": [str(path) for path in dictOutputs],
+        "archiveFiles": [{"path": str((objArchive / path.name).relative_to(objRoot)), "sha256": hashlib.sha256(data).hexdigest()}
+                         for path, data in dictSourceBytes.items()],
+        "historyFiles": [{"path": str(path.relative_to(objRoot)), "sha256": hashlib.sha256(dictOutputs[path]).hexdigest()}
+                         for path in listHistoricalPaths],
+    }
+    write_exclusive_bytes(migration_record_path(objExcelPath), json.dumps(objRecord, ensure_ascii=False, indent=2).encode("utf-8"))
+    try:
+        for objTarget, objTemp in dictStaged.items():
+            objTarget.parent.mkdir(parents=True, exist_ok=True)
+            write_exclusive_bytes(objTarget, objTemp.read_bytes())
+        for objDirectory in setDirectories:
+            validate_history_state(*find_history_files(str(objExcelPath), objDirectory=objDirectory))
+        # 全移行先が検証できるまで、旧ファイルは元の場所に残します。
+        objArchive.mkdir()
+        for objSource, bytesContent in dictSourceBytes.items():
+            write_exclusive_bytes(objArchive / objSource.name, bytesContent)
+        for objSource, bytesContent in dictSourceBytes.items():
+            if (objSource.read_bytes() != bytesContent
+                    or (objArchive / objSource.name).read_bytes() != bytesContent):
+                raise OSError("旧履歴の保管内容または元ファイルが変化しました。")
+        for objSource in dictSourceBytes:
+            objSource.unlink()
+        objRecord["state"] = "completed"
+        atomic_json(migration_record_path(objExcelPath), objRecord)
+    except Exception as objException:
+        raise OSError("旧履歴の移行に失敗しました。自動復旧は行いません。\n復旧案内: "
+                      + str(objRecovery) + "\n詳細: " + str(objException)) from objException
+    print("旧履歴を注文別の履歴フォルダーへ引き継ぎました。")
+    print("旧履歴の原本保管先: " + str(objArchive))
 
 
 def pending_path(objExcelPath: Path) -> Path:
@@ -472,6 +757,7 @@ def processing_lock(objExcelPath: Path):
                 + "\n記録ファイル内のbackupDirectoryにあるrecovery.txtを確認してください。"
                 + "\n記録ファイル: " + str(objPendingPath)
             )
+        check_migration_record(objExcelPath)
         if objExcelPath.with_name("~$" + objExcelPath.name).exists():
             raise ValueError("入力Excelが開かれています。保存してExcelを閉じてください。")
         yield
@@ -500,7 +786,8 @@ def save_output_set(
     pending記録は正式反映前に作成し、全処理成功時だけ削除します。
     停電等で履歴だけ整合して残っても、記録があれば次回処理を停止します。
     """
-    objHistoryPath, objLatestPath = build_snapshot_paths(str(objExcelPath), iHistoryNumber)
+    objHistoryPath, objLatestPath = build_snapshot_paths(str(objExcelPath), iHistoryNumber, listRows)
+    objHistoryPath.parent.mkdir(parents=True, exist_ok=True)
     if objHistoryPath.exists() or objLatestPath.exists():
         raise ValueError("今回の保存先の履歴が既に存在します。上書きしません。")
     objBackupDirectory = (
@@ -639,9 +926,11 @@ def process_excel_file(pszInputFileFullPath: str) -> None:
         objWorkbook = load_workbook(io.BytesIO(bytesOriginalExcel))
         try:
             listRows = read_excel_rows(find_target_worksheet(objWorkbook))
-            bIsFirstRun, objPreviousLatestPath, iNumber = validate_history_state(*find_history_files(str(objExcelPath)))
+            migrate_legacy_history(objExcelPath)
+            bIsFirstRun, objPreviousLatestPath, iNumber = validate_history_state(*find_history_files(str(objExcelPath), listRows))
             if bIsFirstRun or objPreviousLatestPath is None:
                 raise ValueError("比較用履歴がありません。編集前に--prepareを実行してください。")
+            validate_prepared_order(objExcelPath, listRows)
             listChangedCells = compare_quantity(listRows, load_previous_tsv(objPreviousLatestPath))
             objHistoryPath, objLatestPath, objBackup = save_output_set(
                 objExcelPath, bytesOriginalExcel, objWorkbook, listRows, iNumber, objPreviousLatestPath,
@@ -664,7 +953,8 @@ def prepare_history_before_edit(pszInputFileFullPath: str) -> None:
         objWorkbook = load_workbook(io.BytesIO(bytesOriginalExcel))
         try:
             listRows = read_excel_rows(find_target_worksheet(objWorkbook))
-            bIsFirstRun, objPreviousLatestPath, iNumber = validate_history_state(*find_history_files(str(objExcelPath)))
+            migrate_legacy_history(objExcelPath)
+            bIsFirstRun, objPreviousLatestPath, iNumber = validate_history_state(*find_history_files(str(objExcelPath), listRows))
             if bIsFirstRun:
                 objHistoryPath, objLatestPath, objBackup = save_output_set(
                     objExcelPath, bytesOriginalExcel, objWorkbook, listRows, iNumber, None,
@@ -677,6 +967,8 @@ def prepare_history_before_edit(pszInputFileFullPath: str) -> None:
                 validate_matching_orders(listRows, load_previous_tsv(objPreviousLatestPath))
                 remove_old_error_file(str(objExcelPath))
                 print("編集前の履歴確認が完了しました。")
+            save_prepared_order(objExcelPath, listRows)
+            print("Prepared order: " + order_token(listRows))
         finally:
             objWorkbook.close()
 
