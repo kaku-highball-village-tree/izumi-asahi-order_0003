@@ -324,6 +324,7 @@ class WindowsDropTarget:
         self.con = win32con
         self.api = win32api
         self.accept = accept
+        self.closed = False
         root.update_idletasks()
         self.handle = win32gui.GetAncestor(root.winfo_id(), 2)  # GA_ROOT
         self.previous = win32gui.SetWindowLong(self.handle, win32con.GWL_WNDPROC, self.window_proc)
@@ -339,9 +340,39 @@ class WindowsDropTarget:
             return 0
         return self.gui.CallWindowProc(self.previous, handle, message, wparam, lparam)
 
+    def restore_window_proc(self):
+        """pywin32が返した元のWNDPROCポインターを、ネイティブAPIで戻します。"""
+        if callable(self.previous) or isinstance(self.previous, dict):
+            self.gui.SetWindowLong(self.handle, self.con.GWL_WNDPROC, self.previous)
+            return
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        if ctypes.sizeof(ctypes.c_void_p) == 8:
+            set_window_long = user32.SetWindowLongPtrW
+            value_type = ctypes.c_ssize_t
+        else:
+            set_window_long = user32.SetWindowLongW
+            value_type = wintypes.LONG
+        set_window_long.argtypes = (wintypes.HWND, ctypes.c_int, value_type)
+        set_window_long.restype = value_type
+        ctypes.set_last_error(0)
+        previous = set_window_long(self.handle, self.con.GWL_WNDPROC, self.previous)
+        error = ctypes.get_last_error()
+        if previous == 0 and error != 0:
+            raise OSError(error, "元のWindowsウィンドウ処理を復元できませんでした。")
+
     def close(self):
-        self.gui.DragAcceptFiles(self.handle, False)
-        self.gui.SetWindowLong(self.handle, self.con.GWL_WNDPROC, self.previous)
+        if self.closed:
+            return
+        if not self.gui.IsWindow(self.handle):
+            self.closed = True
+            return
+        try:
+            self.gui.DragAcceptFiles(self.handle, False)
+        finally:
+            # 受付停止に失敗しても、元のウィンドウ処理の復元は試みます。
+            self.restore_window_proc()
+            self.closed = True
 
 
 class LauncherApp:
@@ -357,6 +388,7 @@ class LauncherApp:
         self.worker_busy = False
         self.selected_path: Path | None = None
         self.closed = False
+        self.closing = False
         self.drop_target = None
         self.mode_var = tk.IntVar(value=0)
         self.file_var = tk.StringVar(value="ここに入力Excelを1つドラッグ＆ドロップしてください。")
@@ -522,18 +554,40 @@ class LauncherApp:
         self.timer_id = self.root.after(80, self.drain_events)
 
     def on_close(self) -> None:
-        if self.worker_busy or self.workflow.state == "running":
-            self.dialogs.showinfo(WINDOW_TITLE, "処理中は終了できません。Excelや商品選択画面の操作を終え、処理の完了を待ってください。",
-                                  parent=self.root)
+        if self.closed or self.closing:
             return
-        if self.workflow.state in REVIEW_STATES:
-            if not self.dialogs.askyesno(WINDOW_TITLE, "帳票を作成せず終了しますか？数量修正・赤字・履歴は保存済みです。", parent=self.root):
+        self.closing = True
+        try:
+            if self.worker_busy or self.workflow.state == "running":
+                self.dialogs.showinfo(WINDOW_TITLE, "処理中は終了できません。Excelや商品選択画面の操作を終え、処理の完了を待ってください。",
+                                      parent=self.root)
                 return
-        self.closed = True
-        self.root.after_cancel(self.timer_id)
-        if self.drop_target is not None:
-            self.drop_target.close()
-        self.root.destroy()
+            if self.workflow.state in REVIEW_STATES:
+                if not self.dialogs.askyesno(WINDOW_TITLE, "帳票を作成せず終了しますか？数量修正・赤字・履歴は保存済みです。", parent=self.root):
+                    return
+            self.closed = True
+            errors = []
+            try:
+                if self.drop_target is not None:
+                    self.drop_target.close()
+            except Exception as exception:
+                errors.append(exception)
+            try:
+                if self.timer_id is not None:
+                    self.root.after_cancel(self.timer_id)
+                    self.timer_id = None
+            except Exception as exception:
+                errors.append(exception)
+            finally:
+                # 後片付けの一部が失敗しても、操作不能の画面を残しません。
+                try:
+                    self.root.destroy()
+                finally:
+                    self.root.quit()
+                    for exception in errors:
+                        print("終了時の後片付けで問題が発生しました: " + str(exception), file=sys.stderr)
+        finally:
+            self.closing = False
 
 
 def main() -> None:
