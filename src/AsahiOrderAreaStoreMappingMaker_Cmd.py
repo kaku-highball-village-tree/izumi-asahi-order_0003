@@ -21,6 +21,11 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 
 TARGET_WORKSHEET_NAMES: tuple[str, str] = ("本州マグロ(週間)", "割り")
+FALLBACK_WEEKLY_WORKSHEET_NAME: str = "総量店別【本州地区】"
+FALLBACK_DISTRIBUTION_CENTER_NAMES: dict[str, str] = {
+    "②岡山センター": "②広島センター(岡山・四国転送分)",
+    "③四国センター": "②広島センター(岡山・四国転送分)",
+}
 SUPPORTED_EXTENSIONS: set[str] = {".xlsx"}
 MAX_BACKUP_NUMBER: int = 9999
 AREA_STORE_MAPPING_FILE_NAME: str = "AsahiOrderAreaStoreMapping_週間_step0001.tsv"
@@ -221,6 +226,15 @@ def read_worksheet_rows(objWorksheet: Worksheet) -> tuple[list[list[object]], in
     return listRows, iLastDataColumn
 
 
+def select_weekly_worksheet_name(listWorksheetNames: list[str]) -> str:
+    """従来シートを優先し、ない場合だけ本州総量シートを選びます。"""
+    if TARGET_WORKSHEET_NAMES[0] in listWorksheetNames:
+        return TARGET_WORKSHEET_NAMES[0]
+    if FALLBACK_WEEKLY_WORKSHEET_NAME in listWorksheetNames:
+        return FALLBACK_WEEKLY_WORKSHEET_NAME
+    return TARGET_WORKSHEET_NAMES[0]
+
+
 def read_excel_worksheets(
     pszInputFileFullPath: str,
 ) -> tuple[dict[str, tuple[list[list[object]], int]], list[str]]:
@@ -229,7 +243,8 @@ def read_excel_worksheets(
     try:
         dictWorksheetResults: dict[str, tuple[list[list[object]], int]] = {}
         listMissingWorksheetNames: list[str] = []
-        for pszWorksheetName in TARGET_WORKSHEET_NAMES:
+        pszWeeklyWorksheetName = select_weekly_worksheet_name(objWorkbook.sheetnames)
+        for pszWorksheetName in (pszWeeklyWorksheetName, "割り"):
             if pszWorksheetName not in objWorkbook.sheetnames:
                 listMissingWorksheetNames.append(pszWorksheetName)
                 continue
@@ -1360,10 +1375,91 @@ def extract_store_group_rows(
     return listMappingRows
 
 
-def build_area_store_mapping_rows(
+def build_total_honshu_mapping_rows(
     listRows: list[list[str]],
 ) -> tuple[list[list[str]], int, int]:
+    """本州総量のTC小計・共有終了行・未使用欄に対応して週間対応表を作成。"""
+    listCenters = find_distribution_centers(listRows)
+    listStoreGroups = find_store_groups(listRows)
+    listAssignedGroups = [
+        (assign_distribution_center(group, listCenters), group)
+        for group in listStoreGroups
+    ]
+    # センター名の統一前の見出し位置で所属・順序・小計を確定します。
+    listAssignedGroups.sort(key=lambda item: (item[0][0], item[0][1], item[1][1], item[1][0]))
+    dictCenterGroups: dict[tuple[int, int, str], list[tuple[int, int, int]]] = {}
+    for center, group in listAssignedGroups:
+        dictCenterGroups.setdefault(center, []).append(group)
+    dictSubtotalRows: dict[tuple[int, int, str], int] = {}
+    for center, groups in dictCenterGroups.items():
+        pszCenterName = center[2]
+        pszArea = pszCenterName[1:]
+        if not pszArea.endswith("センター"):
+            raise ValueError("本州総量のTC小計名を特定できません。配送センター = " + pszCenterName)
+        pszSubtotal = pszArea.removesuffix("センター") + "TC小計"
+        iStartRow = min(group[0] for group in groups) + 1
+        # 同じ店舗列領域の下に別のセンター見出しがあれば、その先は読みません。
+        # 右側の独立した表の見出しが下にずれていても、こちらの表を打ち切りません。
+        iLastCodeColumn = max(group[1] for group in groups)
+        iEndRow = min([len(listRows)] + [other[0] for other in listCenters
+                                       if other[0] > center[0] and center[1] <= other[1] <= iLastCodeColumn])
+        setSubtotalRows: set[int] = set()
+        for iRow in range(iStartRow, iEndRow):
+            for _, iCodeColumn, _ in groups:
+                pszValue = get_row_value(listRows[iRow], iCodeColumn).strip()
+                if pszValue in (pszSubtotal, "小計"):
+                    setSubtotalRows.add(iRow)
+                elif pszValue.endswith("TC小計"):
+                    raise ValueError(
+                        "所属センターと異なるTC小計があります。配送センター = " + pszCenterName
+                        + "、期待小計 = " + pszSubtotal + "、実際 = " + pszValue
+                        + "、行 = " + str(iRow + 1) + "、列 = " + str(iCodeColumn + 1)
+                    )
+        if len(setSubtotalRows) != 1:
+            raise ValueError(
+                "所属センターの小計行を一意に特定できません。配送センター = " + pszCenterName
+                + "、期待小計 = " + pszSubtotal + "、候補行 = "
+                + ", ".join(str(row + 1) for row in sorted(setSubtotalRows))
+                + "、店舗見出し行 = " + ", ".join(str(group[0] + 1) for group in groups)
+            )
+        iSubtotalRow = next(iter(setSubtotalRows))
+        if any(group[0] >= iSubtotalRow for group in groups):
+            raise ValueError("小計行が店舗見出しより下にありません。配送センター = " + pszCenterName)
+        dictSubtotalRows[center] = iSubtotalRow
+
+    listMappingRows: list[list[str]] = []
+    for center, group in listAssignedGroups:
+        iHeaderRow, iCodeColumn, iNameColumn = group
+        listGroupRows: list[list[str]] = []
+        for listValues in listRows[iHeaderRow + 1:dictSubtotalRows[center]]:
+            pszCode = get_row_value(listValues, iCodeColumn)
+            pszName = get_row_value(listValues, iNameColumn)
+            if pszCode.strip() == "" or pszName.strip() == "":
+                continue
+            if pszCode == "店舗コード" or pszName.endswith("店舗名"):
+                continue
+            # 数式の保存済み計算結果0も、TSVでは文字列になります。
+            if re.fullmatch(r"0+(?:\.0+)?", pszCode.strip()) and re.fullmatch(r"0+(?:\.0+)?", pszName.strip()):
+                continue
+            listGroupRows.append([
+                FALLBACK_DISTRIBUTION_CENTER_NAMES.get(center[2], center[2]), pszCode, pszName,
+            ])
+        if not listGroupRows:
+            raise ValueError(
+                "店舗グループに未使用欄以外の店舗がありません。配送センター = " + center[2]
+                + "、ヘッダー行 = " + str(iHeaderRow + 1) + "、店舗コード列 = " + str(iCodeColumn + 1)
+            )
+        listMappingRows.extend(listGroupRows)
+    return listMappingRows, len(dictCenterGroups), len(listAssignedGroups)
+
+
+def build_area_store_mapping_rows(
+    listRows: list[list[str]],
+    bTotalHonshu: bool = False,
+) -> tuple[list[list[str]], int, int]:
     """配送センターと全店舗グループを検出して3列の対応表を返します。"""
+    if bTotalHonshu:
+        return build_total_honshu_mapping_rows(listRows)
     listCenters: list[tuple[int, int, str]] = find_distribution_centers(listRows)
     listStoreGroups: list[tuple[int, int, int]] = find_store_groups(listRows)
     listAssignedGroups: list[
@@ -1414,18 +1510,19 @@ def get_area_store_mapping_output_path(objInputTsvPath: Path) -> Path:
 
 def process_area_store_mapping_file(
     objInputTsvPath: Path,
+    pszWorksheetName: str = TARGET_WORKSHEET_NAMES[0],
 ) -> tuple[Path, int, int, int]:
-    """本州マグロ週間TSVから店舗対応表を独立して作成します。"""
+    """選択した週間元シートのTSVから店舗対応表を作成します。"""
     if not objInputTsvPath.exists() or not objInputTsvPath.is_file():
         raise ValueError("週間TSVが見つかりません。Path = " + str(objInputTsvPath))
     listRows: list[list[str]] = read_tsv_rows(objInputTsvPath)
     try:
         listMappingRows, iCenterCount, iGroupCount = build_area_store_mapping_rows(
-            listRows
+            listRows, pszWorksheetName == FALLBACK_WEEKLY_WORKSHEET_NAME
         )
     except ValueError as objException:
         raise ValueError(
-            str(objException) + " Path = " + str(objInputTsvPath)
+            str(objException) + " Sheet = " + pszWorksheetName + " Path = " + str(objInputTsvPath)
         ) from objException
     objOutputPath: Path = get_area_store_mapping_output_path(objInputTsvPath)
     objTemporaryPath: Path = create_temporary_path(objOutputPath)
@@ -1488,6 +1585,7 @@ def build_warning_text(
     dictBackupPaths: dict[str, Path],
     dictMappingOutputPaths: dict[str, Path],
     dictMappingBackupPaths: dict[str, Path],
+    tupleTargetWorksheetNames: tuple[str, str] = TARGET_WORKSHEET_NAMES,
 ) -> str:
     """未検出シート、作成TSV、旧TSVバックアップを含む警告文を返します。"""
     listLines: list[str] = [
@@ -1496,7 +1594,7 @@ def build_warning_text(
         "未検出シート: " + ", ".join(listMissingWorksheetNames),
         "警告内容: 対象シートが見つからないため、このシートのTSVは作成しませんでした。",
     ]
-    for pszWorksheetName in TARGET_WORKSHEET_NAMES:
+    for pszWorksheetName in tupleTargetWorksheetNames:
         if pszWorksheetName in listMissingWorksheetNames:
             continue
         listLines.append("作成したTSV: " + str(dictOutputPaths[pszWorksheetName]))
@@ -1509,7 +1607,7 @@ def build_warning_text(
         listLines.append(
             "旧TSVのバックアップパス: " + str(dictBackupPaths[pszWorksheetName])
         )
-    for pszWorksheetName in TARGET_WORKSHEET_NAMES:
+    for pszWorksheetName in tupleTargetWorksheetNames:
         objMappingOutputPath: Path = dictMappingOutputPaths[pszWorksheetName]
         if pszWorksheetName in listMissingWorksheetNames:
             listLines.append(
@@ -1583,14 +1681,16 @@ def process_input_file(pszInputFileFullPath: str) -> None:
     dictWorksheetResults, listMissingWorksheetNames = read_excel_worksheets(
         pszValidatedPath
     )
+    pszWeeklyWorksheetName = select_weekly_worksheet_name(list(dictWorksheetResults))
+    tupleTargetWorksheetNames = (pszWeeklyWorksheetName, "割り")
     dictOutputPaths: dict[str, Path] = {
         pszWorksheetName: get_output_file_path(pszValidatedPath, pszWorksheetName)
-        for pszWorksheetName in TARGET_WORKSHEET_NAMES
+        for pszWorksheetName in tupleTargetWorksheetNames
     }
     dictMappingOutputPaths: dict[str, Path] = {
         "割り": get_allocation_mapping_output_path(dictOutputPaths["割り"]),
-        "本州マグロ(週間)": get_area_store_mapping_output_path(
-            dictOutputPaths["本州マグロ(週間)"]
+        pszWeeklyWorksheetName: get_area_store_mapping_output_path(
+            dictOutputPaths[pszWeeklyWorksheetName]
         ),
     }
     dictBackupPaths: dict[str, Path] = {}
@@ -1627,6 +1727,7 @@ def process_input_file(pszInputFileFullPath: str) -> None:
                     dictBackupPaths,
                     dictMappingOutputPaths,
                     dictMappingBackupPaths,
+                    tupleTargetWorksheetNames,
                 ),
             )
         dictMissingOutputBackups: dict[Path, Path] = {
@@ -1654,7 +1755,7 @@ def process_input_file(pszInputFileFullPath: str) -> None:
     if not dictWorksheetResults:
         raise ValueError(
             "対象シートが見つかりません。対象シート = "
-            + ", ".join(TARGET_WORKSHEET_NAMES)
+            + TARGET_WORKSHEET_NAMES[0] + " または " + FALLBACK_WEEKLY_WORKSHEET_NAME + ", 割り"
         )
     objCreatedAllocationMappingPath: Path | None = None
     iAllocationMappingRowCount: int = 0
@@ -1831,7 +1932,7 @@ def process_input_file(pszInputFileFullPath: str) -> None:
             )
     elif "割り" not in dictWorksheetResults:
         listMappingResultLines.append("処理D（割りstep0003作成）: スキップ")
-    if "本州マグロ(週間)" in dictWorksheetResults:
+    if pszWeeklyWorksheetName in dictWorksheetResults:
         try:
             (
                 objCreatedMappingPath,
@@ -1839,16 +1940,18 @@ def process_input_file(pszInputFileFullPath: str) -> None:
                 iMappingCenterCount,
                 iMappingGroupCount,
             ) = process_area_store_mapping_file(
-                dictOutputPaths["本州マグロ(週間)"]
+                dictOutputPaths[pszWeeklyWorksheetName], pszWeeklyWorksheetName
             )
             listMappingResultLines.append(
-                "処理B（週間配送センター対応表）: 成功\n出力ファイル: "
+                "処理B（週間配送センター対応表）: 成功\n使用シート: "
+                + pszWeeklyWorksheetName
+                + "\n出力ファイル: "
                 + str(objCreatedMappingPath)
             )
         except Exception as objException:
             try:
                 objBackupPath = rename_output_to_backup(
-                    dictMappingOutputPaths["本州マグロ(週間)"]
+                    dictMappingOutputPaths[pszWeeklyWorksheetName]
                 )
                 pszBackupDetail = (
                     ""
@@ -1861,7 +1964,9 @@ def process_input_file(pszInputFileFullPath: str) -> None:
                     + str(objBackupException)
                 )
             listMappingErrorLines.append(
-                "処理B（週間配送センター対応表）: エラー\nエラー内容: "
+                "処理B（週間配送センター対応表）: エラー\n使用シート: "
+                + pszWeeklyWorksheetName
+                + "\nエラー内容: "
                 + str(objException)
                 + pszBackupDetail
             )
@@ -1909,7 +2014,7 @@ def process_input_file(pszInputFileFullPath: str) -> None:
             )
     elif objAllocationStep0003Path is not None:
         objExpectedWeeklyMappingPath: Path = dictMappingOutputPaths[
-            "本州マグロ(週間)"
+            pszWeeklyWorksheetName
         ]
         pszStep0004ErrorMessage: str = (
             "今回の実行で週間step0001 TSVが作成されませんでした。Path = "
@@ -2026,7 +2131,7 @@ def process_input_file(pszInputFileFullPath: str) -> None:
     remove_old_error_file(pszValidatedPath)
     print("朝日注文エリア店舗対応調査用TSVファイルを作成しました。")
     print("Input: " + pszValidatedPath)
-    for pszWorksheetName in TARGET_WORKSHEET_NAMES:
+    for pszWorksheetName in tupleTargetWorksheetNames:
         if pszWorksheetName not in dictWorksheetResults:
             continue
         listRows, iColumnCount = dictWorksheetResults[pszWorksheetName]
@@ -2041,9 +2146,10 @@ def process_input_file(pszInputFileFullPath: str) -> None:
     if listMissingWorksheetNames:
         print("Warning File: " + str(objWarningPath))
     if objCreatedMappingPath is not None:
+        print("Weekly Area Store Mapping Source Worksheet: " + pszWeeklyWorksheetName)
         print(
             "Weekly Area Store Mapping Input: "
-            + str(dictOutputPaths["本州マグロ(週間)"])
+            + str(dictOutputPaths[pszWeeklyWorksheetName])
         )
         print("Weekly Area Store Mapping TSV: " + str(objCreatedMappingPath))
         print("Weekly Area Store Mapping Rows: " + str(iMappingRowCount))
