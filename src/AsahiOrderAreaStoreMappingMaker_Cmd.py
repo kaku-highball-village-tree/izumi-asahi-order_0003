@@ -295,8 +295,34 @@ def is_allocation_store_data_row(listValues: list[str]) -> bool:
     return all(pszValue.strip() != "" for pszValue in listValues[1:6])
 
 
-def build_allocation_mapping_rows(listRows: list[list[str]]) -> list[list[str]]:
-    """単位行より後ろから割り対応表の2～6列目を抽出します。"""
+def build_total_honshu_allocation_mapping_rows(
+    listRows: list[list[str]],
+) -> list[list[str]]:
+    """本州総量形式のE列「単位」以降を既存の5項目へ組み直します。"""
+    iUnitRowIndex = next(
+        (i for i, values in enumerate(listRows) if len(values) >= 5 and values[4] == "単位"),
+        None,
+    )
+    if iUnitRowIndex is None:
+        raise ValueError("割りTSV内に5列目が「単位」の行が見つかりません。")
+    listMappingRows: list[list[str]] = []
+    for values in listRows[iUnitRowIndex + 1:]:
+        # B=エリア、C=店舗略称、D=コード、E=APEX店舗名。
+        # F列以降は数量なので、店舗行の判定・出力には使用しません。
+        if len(values) < 5 or not all(value.strip() != "" for value in values[1:5]):
+            continue
+        listMappingRows.append([values[1], values[3], values[2], values[3], values[4]])
+    if not listMappingRows:
+        raise ValueError("5列目が「単位」の行より後ろに店舗データが見つかりません。")
+    return listMappingRows
+
+
+def build_allocation_mapping_rows(
+    listRows: list[list[str]], bTotalHonshu: bool = False,
+) -> list[list[str]]:
+    """選択した週間元に応じた割り形式から、既存の5項目を抽出します。"""
+    if bTotalHonshu:
+        return build_total_honshu_allocation_mapping_rows(listRows)
     iUnitRowIndex: int | None = None
     for iRowIndex, listValues in enumerate(listRows):
         if len(listValues) >= 6 and listValues[5] == "単位":
@@ -335,13 +361,15 @@ def save_allocation_mapping_tsv(
         objWriter.writerows(listMappingRows)
 
 
-def process_allocation_mapping_file(objInputTsvPath: Path) -> tuple[Path, int]:
+def process_allocation_mapping_file(
+    objInputTsvPath: Path, bTotalHonshu: bool = False,
+) -> tuple[Path, int]:
     """割りTSVから割り対応表を独立して作成します。"""
     if not objInputTsvPath.exists() or not objInputTsvPath.is_file():
         raise ValueError("割りTSVが見つかりません。Path = " + str(objInputTsvPath))
     listRows: list[list[str]] = read_tsv_rows(objInputTsvPath)
     try:
-        listMappingRows: list[list[str]] = build_allocation_mapping_rows(listRows)
+        listMappingRows: list[list[str]] = build_allocation_mapping_rows(listRows, bTotalHonshu)
     except ValueError as objException:
         raise ValueError(
             str(objException) + " Path = " + str(objInputTsvPath)
@@ -1803,7 +1831,9 @@ def process_input_file(pszInputFileFullPath: str) -> None:
             (
                 objCreatedAllocationMappingPath,
                 iAllocationMappingRowCount,
-            ) = process_allocation_mapping_file(dictOutputPaths["割り"])
+            ) = process_allocation_mapping_file(
+                dictOutputPaths["割り"], pszWeeklyWorksheetName == FALLBACK_WEEKLY_WORKSHEET_NAME
+            )
             (
                 objStoreCodeMismatchPath,
                 iStoreCodeMismatchCount,
