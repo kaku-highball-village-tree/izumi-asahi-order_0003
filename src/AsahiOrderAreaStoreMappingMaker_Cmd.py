@@ -35,8 +35,9 @@ FALLBACK_DISTRIBUTION_CENTER_NAMES: dict[str, str] = {
 SUPPORTED_EXTENSIONS: set[str] = {".xlsx"}
 MAX_BACKUP_NUMBER: int = 9999
 AREA_STORE_MAPPING_FILE_NAME: str = "AsahiOrderAreaStoreMapping_週間_step0001.tsv"
-AREA_STORE_MAPPING_HEADERS: tuple[str, str, str] = (
+AREA_STORE_MAPPING_HEADERS: tuple[str, str, str, str] = (
     "配送センター名",
+    "エリア名",
     "店舗コード",
     "店舗名",
 )
@@ -837,10 +838,10 @@ def build_allocation_step0004_rows(
             raise ValueError(
                 "週間step0001 TSVのデータ行の列数が正しくありません。行 = "
                 + str(iRowNumber)
-                + "、期待列数 = 3、実際の列数 = "
+                + "、期待列数 = 4、実際の列数 = "
                 + str(len(listValues))
             )
-        pszDistributionCenterName, pszStoreCode, _ = listValues
+        pszDistributionCenterName, _, pszStoreCode, _ = listValues
         if pszDistributionCenterName == "" or pszStoreCode == "":
             raise ValueError(
                 "週間step0001 TSVに空の配送センター名または店舗コードがあります。行 = "
@@ -1111,7 +1112,7 @@ def build_final_weekly_center_lookup(
             continue
         if len(listValues) != len(AREA_STORE_MAPPING_HEADERS):
             raise ValueError("週間step0001 TSVのデータ行の列数が正しくありません。行 = " + str(iRowNumber))
-        pszCenter, pszCode, _ = listValues
+        pszCenter, _, pszCode, _ = listValues
         if pszCode == "":
             raise ValueError("週間step0001 TSVに空の店舗コードがあります。行 = " + str(iRowNumber))
         if pszCode in dictCenters and dictCenters[pszCode] != pszCenter:
@@ -1420,6 +1421,34 @@ def assign_distribution_center(
     return listSameRowCenters[-1]
 
 
+def get_weekly_area_name(pszCenterName: str, pszStoreNameHeader: str) -> str:
+    """センター統一前の見出しからエリア名を取得します。"""
+    dictCenterAreas = {
+        "広島センター": "広島", "岡山センター": "岡山",
+        "四国センター": "四国／岡山", "九州センター": "九州",
+        "熊本チルドセンター": "熊本", "北九州チルドセンター": "北九州",
+    }
+    pszCenter = pszCenterName[1:] if pszCenterName.startswith(("①", "②", "③")) else pszCenterName
+    if pszCenter in dictCenterAreas:
+        return dictCenterAreas[pszCenter]
+    # 従来シートは転送分センターを共有し、店舗名見出しで岡山・四国を区別します。
+    for pszArea, pszOutputArea in (("北九州", "北九州"), ("熊本", "熊本"),
+                                  ("九州", "九州"), ("四国", "四国／岡山"),
+                                  ("岡山", "岡山"), ("広島", "広島")):
+        if pszArea in pszStoreNameHeader:
+            return pszOutputArea
+    raise ValueError("週間シートのエリア名を特定できません。配送センター = "
+                     + pszCenterName + "、店舗名見出し = " + pszStoreNameHeader)
+
+
+def build_weekly_mapping_row(pszCenterName: str, pszArea: str, pszCode: str, pszName: str) -> list[str]:
+    """センター名を既存形式へ統一し、先頭丸数字を除いた週間4列を返します。"""
+    pszCenter = FALLBACK_DISTRIBUTION_CENTER_NAMES.get(pszCenterName, pszCenterName)
+    if pszCenter.startswith(("①", "②", "③")):
+        pszCenter = pszCenter[1:]
+    return [pszCenter, pszArea, pszCode, pszName]
+
+
 def extract_store_group_rows(
     listRows: list[list[str]],
     tupleStoreGroup: tuple[int, int, int],
@@ -1427,6 +1456,9 @@ def extract_store_group_rows(
 ) -> list[list[str]]:
     """店舗グループのヘッダー直後から小計まで店舗コード・店舗名を返します。"""
     iHeaderRowIndex, iStoreCodeColumnIndex, iStoreNameColumnIndex = tupleStoreGroup
+    pszArea = get_weekly_area_name(
+        pszDistributionCenterName, get_row_value(listRows[iHeaderRowIndex], iStoreNameColumnIndex)
+    )
     listMappingRows: list[list[str]] = []
     bFoundSubtotal: bool = False
     for listValues in listRows[iHeaderRowIndex + 1 :]:
@@ -1440,7 +1472,7 @@ def extract_store_group_rows(
         if pszStoreCode == "店舗コード" or pszStoreName.endswith("店舗名"):
             continue
         listMappingRows.append(
-            [pszDistributionCenterName, pszStoreCode, pszStoreName]
+            build_weekly_mapping_row(pszDistributionCenterName, pszArea, pszStoreCode, pszStoreName)
         )
     if not bFoundSubtotal:
         raise ValueError(
@@ -1521,6 +1553,7 @@ def build_total_honshu_mapping_rows(
     listMappingRows: list[list[str]] = []
     for center, group in listAssignedGroups:
         iHeaderRow, iCodeColumn, iNameColumn = group
+        pszArea = get_weekly_area_name(center[2], get_row_value(listRows[iHeaderRow], iNameColumn))
         listGroupRows: list[list[str]] = []
         for listValues in listRows[iHeaderRow + 1:dictSubtotalRows[center]]:
             pszCode = get_row_value(listValues, iCodeColumn)
@@ -1532,9 +1565,7 @@ def build_total_honshu_mapping_rows(
             # 数式の保存済み計算結果0も、TSVでは文字列になります。
             if re.fullmatch(r"0+(?:\.0+)?", pszCode.strip()) and re.fullmatch(r"0+(?:\.0+)?", pszName.strip()):
                 continue
-            listGroupRows.append([
-                FALLBACK_DISTRIBUTION_CENTER_NAMES.get(center[2], center[2]), pszCode, pszName,
-            ])
+            listGroupRows.append(build_weekly_mapping_row(center[2], pszArea, pszCode, pszName))
         if not listGroupRows:
             raise ValueError(
                 "店舗グループに未使用欄以外の店舗がありません。配送センター = " + center[2]
@@ -1549,7 +1580,7 @@ def build_area_store_mapping_rows(
     bTotalHonshu: bool = False,
     bKyushu: bool = False,
 ) -> tuple[list[list[str]], int, int]:
-    """配送センターと全店舗グループを検出して3列の対応表を返します。"""
+    """配送センターと全店舗グループを検出してエリア名付き4列の対応表を返します。"""
     if bTotalHonshu or bKyushu:
         return build_total_honshu_mapping_rows(listRows, bKyushu)
     listCenters: list[tuple[int, int, str]] = find_distribution_centers(listRows)
@@ -1588,7 +1619,7 @@ def build_area_store_mapping_rows(
 def save_area_store_mapping_tsv(
     objOutputPath: Path, listMappingRows: list[list[str]]
 ) -> None:
-    """3列ヘッダーと週間店舗対応データをUTF-8 TSVへ保存します。"""
+    """4列ヘッダーと週間店舗対応データをUTF-8 TSVへ保存します。"""
     with objOutputPath.open(mode="w", encoding="utf-8", newline="") as objFile:
         objWriter = csv.writer(objFile, delimiter="\t", lineterminator="\r\n")
         objWriter.writerow(AREA_STORE_MAPPING_HEADERS)
@@ -1642,7 +1673,7 @@ def process_combined_weekly_mapping(
                 read_tsv_rows(objPath), pszSheet == FALLBACK_WEEKLY_WORKSHEET_NAME,
                 pszSheet == KYUSHU_WEEKLY_WORKSHEET_NAME,
             )
-            for pszCenter, pszCode, _ in listRows:
+            for pszCenter, _, pszCode, _ in listRows:
                 if pszCode in dictCenters and dictCenters[pszCode] != pszCenter:
                     raise ValueError("同じ店舗コードに異なる配送センター名があります。店舗コード = "
                                      + pszCode + "、配送センター名 = " + dictCenters[pszCode] + ", " + pszCenter)
@@ -1674,7 +1705,7 @@ def build_weekly_store_warning(
     listMissing = []
     for pszSheet, listRows in listSourceRows:
         pszDistrict = "九州地区" if pszSheet == KYUSHU_WEEKLY_WORKSHEET_NAME else "本州地区"
-        for pszCenter, pszCode, pszName in listRows:
+        for pszCenter, _, pszCode, pszName in listRows:
             if pszCode not in setCodes:
                 listMissing.append([pszDistrict, pszSheet, pszCenter, pszCode, pszName])
     if not listMissing:
