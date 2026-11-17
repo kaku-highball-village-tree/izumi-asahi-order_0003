@@ -1097,10 +1097,36 @@ def get_final_area_store_mapping_paths(
     )
 
 
+def build_final_weekly_center_lookup(
+    listWeeklyRows: list[list[str]],
+) -> dict[str, str]:
+    """最終対応表の空欄補完用に週間TSVを検証し、店舗コードで引けるようにします。"""
+    if not listWeeklyRows:
+        raise ValueError("週間step0001 TSVが空です。")
+    if tuple(listWeeklyRows[0]) != AREA_STORE_MAPPING_HEADERS:
+        raise ValueError("週間step0001 TSVの項目名行が正しくありません。")
+    dictCenters: dict[str, str] = {}
+    for iRowNumber, listValues in enumerate(listWeeklyRows[1:], start=2):
+        if not listValues:
+            continue
+        if len(listValues) != len(AREA_STORE_MAPPING_HEADERS):
+            raise ValueError("週間step0001 TSVのデータ行の列数が正しくありません。行 = " + str(iRowNumber))
+        pszCenter, pszCode, _ = listValues
+        if pszCode == "":
+            raise ValueError("週間step0001 TSVに空の店舗コードがあります。行 = " + str(iRowNumber))
+        if pszCode in dictCenters and dictCenters[pszCode] != pszCenter:
+            raise ValueError(
+                "週間step0001 TSVの同じ店舗コードに異なる配送センター名があります。店舗コード = "
+                + pszCode + "、配送センター名 = " + dictCenters[pszCode] + ", " + pszCenter
+            )
+        dictCenters[pszCode] = pszCenter
+    return dictCenters
+
+
 def build_final_area_store_mapping_rows(
-    listStep0005Rows: list[list[str]],
-) -> tuple[list[list[str]], int, int]:
-    """step0005からエリア名と配送センター名先頭の①・②・③を除きます。"""
+    listStep0005Rows: list[list[str]], listWeeklyRows: list[list[str]],
+) -> tuple[list[list[str]], int, int, int, int]:
+    """空のセンター名を週間で補完し、補完できない行とエリア名・先頭丸数字を除きます。"""
     if not listStep0005Rows:
         raise ValueError("割りstep0005 TSVが空です。")
     if tuple(listStep0005Rows[0]) != ALLOCATION_STEP0004_HEADERS:
@@ -1110,9 +1136,12 @@ def build_final_area_store_mapping_rows(
             + "、実際の値 = "
             + "\\t".join(listStep0005Rows[0])
         )
+    dictWeeklyCenters = build_final_weekly_center_lookup(listWeeklyRows)
     listOutputRows: list[list[str]] = [list(FINAL_AREA_STORE_MAPPING_HEADERS)]
     iFirstCenterChangedCount: int = 0
     iSecondCenterChangedCount: int = 0
+    iRecoveredRowCount: int = 0
+    iExcludedRowCount: int = 0
     for iRowNumber, listValues in enumerate(listStep0005Rows[1:], start=2):
         if not listValues:
             continue
@@ -1129,6 +1158,17 @@ def build_final_area_store_mapping_rows(
             if pszDistributionCenterName.startswith(("①", "②", "③"))
             else pszDistributionCenterName
         )
+        if pszUpdatedCenterName.strip() == "":
+            pszDistributionCenterName = dictWeeklyCenters.get(listValues[2], "")
+            pszUpdatedCenterName = (
+                pszDistributionCenterName[1:]
+                if pszDistributionCenterName.startswith(("①", "②", "③"))
+                else pszDistributionCenterName
+            )
+            if pszUpdatedCenterName.strip() == "":
+                iExcludedRowCount += 1
+                continue
+            iRecoveredRowCount += 1
         if pszDistributionCenterName == "①広島センター":
             iFirstCenterChangedCount += 1
         elif pszDistributionCenterName == "②広島センター(岡山・四国転送分)":
@@ -1139,14 +1179,14 @@ def build_final_area_store_mapping_rows(
     iInputDataRowCount: int = sum(
         1 for listValues in listStep0005Rows[1:] if listValues
     )
-    if len(listOutputRows) - 1 != iInputDataRowCount:
+    if len(listOutputRows) - 1 + iExcludedRowCount != iInputDataRowCount:
         raise ValueError(
-            "割りstep0005と対応表のデータ行数が一致しません。入力行数 = "
+            "割りstep0005の入力行数が対応表の出力行数と除外行数の合計に一致しません。入力行数 = "
             + str(iInputDataRowCount)
             + "、出力行数 = "
             + str(len(listOutputRows) - 1)
         )
-    return listOutputRows, iFirstCenterChangedCount, iSecondCenterChangedCount
+    return listOutputRows, iFirstCenterChangedCount, iSecondCenterChangedCount, iRecoveredRowCount, iExcludedRowCount
 
 
 def get_next_final_mapping_backup_path(objOutputPath: Path) -> Path:
@@ -1206,15 +1246,19 @@ def replace_final_area_store_mapping_files(
 
 def process_final_area_store_mapping_files(
     objStep0005Path: Path,
-) -> tuple[Path, Path, int, int, int, dict[Path, Path]]:
+) -> tuple[Path, Path, int, int, int, dict[Path, Path], int, int, int]:
     """割りstep0005を再読込し、同一内容の最終対応表TXT・TSVを作ります。"""
     if not objStep0005Path.exists() or not objStep0005Path.is_file():
         raise ValueError(
             "割りstep0005 TSVが見つかりません。Path = " + str(objStep0005Path)
         )
     listStep0005Rows: list[list[str]] = read_tsv_rows(objStep0005Path)
-    listOutputRows, iFirstCenterChangedCount, iSecondCenterChangedCount = (
-        build_final_area_store_mapping_rows(listStep0005Rows)
+    objWeeklyPath = objStep0005Path.with_name(AREA_STORE_MAPPING_FILE_NAME)
+    if not objWeeklyPath.is_file():
+        raise ValueError("週間step0001 TSVが見つかりません。Path = " + str(objWeeklyPath))
+    listWeeklyRows = read_tsv_rows(objWeeklyPath)
+    listOutputRows, iFirstCenterChangedCount, iSecondCenterChangedCount, iRecoveredRowCount, iExcludedRowCount = (
+        build_final_area_store_mapping_rows(listStep0005Rows, listWeeklyRows)
     )
     objTextPath, objTsvPath, _ = get_final_area_store_mapping_paths(
         objStep0005Path
@@ -1254,6 +1298,9 @@ def process_final_area_store_mapping_files(
         iFirstCenterChangedCount,
         iSecondCenterChangedCount,
         dictBackupPaths,
+        len(listOutputRows) - 1 + iExcludedRowCount,
+        iRecoveredRowCount,
+        iExcludedRowCount,
     )
 
 
@@ -1903,6 +1950,9 @@ def process_input_file(pszInputFileFullPath: str) -> None:
     objFinalMappingTextPath: Path | None = None
     objFinalMappingTsvPath: Path | None = None
     iFinalMappingRowCount: int = 0
+    iFinalInputRowCount: int = 0
+    iFinalRecoveredRowCount: int = 0
+    iFinalExcludedRowCount: int = 0
     iFinalFirstCenterChangedCount: int = 0
     iFinalSecondCenterChangedCount: int = 0
     dictFinalMappingBackupPaths: dict[Path, Path] = {}
@@ -2217,6 +2267,9 @@ def process_input_file(pszInputFileFullPath: str) -> None:
                 iFinalFirstCenterChangedCount,
                 iFinalSecondCenterChangedCount,
                 dictFinalMappingBackupPaths,
+                iFinalInputRowCount,
+                iFinalRecoveredRowCount,
+                iFinalExcludedRowCount,
             ) = process_final_area_store_mapping_files(objAllocationStep0005Path)
             _, _, objFinalMappingErrorPath = get_final_area_store_mapping_paths(
                 objAllocationStep0005Path
@@ -2228,6 +2281,10 @@ def process_input_file(pszInputFileFullPath: str) -> None:
                 + str(objFinalMappingTextPath)
                 + "\n出力TSV: "
                 + str(objFinalMappingTsvPath)
+                + "\n入力件数: " + str(iFinalInputRowCount)
+                + "\n週間からの補完件数: " + str(iFinalRecoveredRowCount)
+                + "\n除外件数: " + str(iFinalExcludedRowCount)
+                + "\n出力件数: " + str(iFinalMappingRowCount)
             )
         except Exception as objException:
             try:
@@ -2401,6 +2458,9 @@ def process_input_file(pszInputFileFullPath: str) -> None:
         print("Final Area Store Mapping TXT: " + str(objFinalMappingTextPath))
         print("Final Area Store Mapping TSV: " + str(objFinalMappingTsvPath))
         print("Final Area Store Mapping Rows: " + str(iFinalMappingRowCount))
+        print("Final Area Store Mapping Input Rows: " + str(iFinalInputRowCount))
+        print("Final Area Store Mapping Recovered Rows: " + str(iFinalRecoveredRowCount))
+        print("Final Area Store Mapping Excluded Rows: " + str(iFinalExcludedRowCount))
         print(
             "Final Area Store Mapping ①広島センター Changed Rows: "
             + str(iFinalFirstCenterChangedCount)
