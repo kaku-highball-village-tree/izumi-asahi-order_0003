@@ -101,10 +101,6 @@ FINAL_AREA_STORE_MAPPING_HEADERS: tuple[str, str, str] = (
     "店舗コード",
     "店舗略称",
 )
-FINAL_DISTRIBUTION_CENTER_NAMES: dict[str, str] = {
-    "①広島センター": "広島センター",
-    "②広島センター(岡山・四国転送分)": "広島センター(岡山・四国転送分)",
-}
 CIRCLED_NUMBERS: str = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
 
@@ -1104,7 +1100,7 @@ def get_final_area_store_mapping_paths(
 def build_final_area_store_mapping_rows(
     listStep0005Rows: list[list[str]],
 ) -> tuple[list[list[str]], int, int]:
-    """step0005からエリア名を除き、指定配送センター名を修正します。"""
+    """step0005からエリア名と配送センター名先頭の①・②・③を除きます。"""
     if not listStep0005Rows:
         raise ValueError("割りstep0005 TSVが空です。")
     if tuple(listStep0005Rows[0]) != ALLOCATION_STEP0004_HEADERS:
@@ -1128,8 +1124,10 @@ def build_final_area_store_mapping_rows(
                 + str(len(listValues))
             )
         pszDistributionCenterName: str = listValues[0]
-        pszUpdatedCenterName: str = FINAL_DISTRIBUTION_CENTER_NAMES.get(
-            pszDistributionCenterName, pszDistributionCenterName
+        pszUpdatedCenterName: str = (
+            pszDistributionCenterName[1:]
+            if pszDistributionCenterName.startswith(("①", "②", "③"))
+            else pszDistributionCenterName
         )
         if pszDistributionCenterName == "①広島センター":
             iFirstCenterChangedCount += 1
