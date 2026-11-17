@@ -140,6 +140,9 @@ def build_success_summary_message(
     pszInputFileFullPath: str, pszResultFileFullPath: str
 ) -> str:
     """正常終了MessageBox用の短い要約を返します。"""
+    pszWarningPath = os.path.splitext(pszInputFileFullPath)[0] + "_warning.txt"
+    pszWarning = ("\n\n確認が必要な警告があります。\n警告ファイル: " + os.path.basename(pszWarningPath)
+                  if os.path.isfile(pszWarningPath) else "")
     return (
         "朝日注文エリア店舗対応TSVの作成が正常に完了しました。\n\n"
         + "入力ファイル:\n"
@@ -149,6 +152,7 @@ def build_success_summary_message(
         + "\n\n詳細結果:\n"
         + os.path.basename(pszResultFileFullPath)
         + "\n\n各ファイルは入力ファイルと同じフォルダーに保存しました。"
+        + pszWarning
     )
 
 
@@ -233,18 +237,18 @@ def draw_instruction_text(iWindowHandle: int) -> None:
     pszInstructionText: str = (
         ".xlsxファイルを1つだけ、このウィンドウにドラッグ＆ドロップしてください。\n"
         "週間元は「本州マグロ(週間)」を優先し、なければ「総量店別【本州地区】」を使います。\n"
-        "選択した週間元シートと「割り」のセル値をTSVへ変換します。\n"
-        "「割り」の単位行は従来形式ではF列、本州総量形式ではE列を探します。\n"
-        "店舗情報を共通の5項目へそろえ、本州総量形式ではD列のコードを2項目で共用します。\n"
+        "九州地区の総量シートがあれば追加し、各元シートと「割り」をTSVへ変換します。\n"
+        "「割り」の単位行は従来形式ではF列、総量形式ではE列を探します。\n"
+        "店舗情報を共通の5項目へそろえ、総量形式ではD列のコードを2項目で共用します。\n"
         "割り店舗対応表から店舗コード・店舗名の不一致TSVを作成します。\n"
         "既存の不一致TSVは.bk0001.tsv形式でバックアップします。\n"
         "正式店舗名.txtは必須で、正式名を反映したstep0002 TSVを作成します。\n"
         "正式店舗名.txtがない場合はstep0002_error.txtを作成します。\n"
         "step0002からAPEXの2列を除いたstep0003 TSVを作成します。\n"
         "週間店舗対応表から配送センター名を付けたstep0004 TSVを作成します。\n"
-        "指定エリアを除外し、配送センター名を補完したstep0005 TSVを作成します。\n"
+        "九州側の店舗も残し、空の配送センター名を補完したstep0005 TSVを作成します。\n"
         "step0005からエリア名を除いた最終対応表TXT・TSVを作成します。\n"
-        "選択した週間元から対応表を作成し、本州総量の岡山・四国は転送分センター名に統一します。\n"
+        "本州総量の岡山・四国は転送分センター名に統一し、週間だけの店舗は_warning.txtへ記録します。\n"
         "対象シートがない場合は_warning.txtを出力します。\n"
         "存在しないシートの旧TSVは.bk0001.tsv形式へ名前変更します。\n"
         "既存の出力ファイルは自動的に上書きします。\n"
@@ -312,7 +316,10 @@ def window_proc(
                     pszResultFileFullPath, _ = save_result_text(
                         pszDroppedFilePath, pszResultMessage
                     )
-                    show_message_box(
+                    objShowMessage = (show_warning_message_box
+                                      if os.path.isfile(os.path.splitext(pszDroppedFilePath)[0] + "_warning.txt")
+                                      else show_message_box)
+                    objShowMessage(
                         build_success_summary_message(
                             pszDroppedFilePath, pszResultFileFullPath
                         ),
