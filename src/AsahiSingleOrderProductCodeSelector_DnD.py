@@ -22,6 +22,7 @@ WINDOW_TITLE: str = (
     "Asahi Single Order Product Code Selector step0001-step0005 (Drag & Drop)"
 )
 CMD_FILE_NAME: str = "AsahiSingleOrderProductCodeSelector_Cmd.py"
+INVALID_WEIGHT_CATEGORY_EXIT_CODE: int = 4
 PRODUCTS_FILE_NAME: str = "products_all_109_readable.tsv"
 WEEKLY_TEMPLATE_FILE_NAME: str = "template_イズミ週間予定表_3列.xlsx"
 HIROSHIMA_WEEKLY_TEMPLATE_FILE_NAME: str = (
@@ -208,6 +209,8 @@ def run_product_code_selector_cmd(
         return "cancelled", objCompletedProcess.stderr
     if objCompletedProcess.returncode == 3:
         return "not_found", objCompletedProcess.stderr
+    if objCompletedProcess.returncode == INVALID_WEIGHT_CATEGORY_EXIT_CODE:
+        return "invalid_weight_category", objCompletedProcess.stderr
     if objCompletedProcess.returncode != 0:
         pszStdErr: str = objCompletedProcess.stderr
         if pszStdErr.strip() == "":
@@ -419,6 +422,8 @@ def window_proc(iWindowHandle: int, iMessage: int, iWparam: int, iLparam: int) -
             listCancelledFileNames: list[str] = []
             listNotFoundFileNames: list[str] = []
             listSuccessDetails: list[str] = []
+            listInvalidWeightFileNames: list[str] = []
+            pszWeightCategoryMessage: str = ""
             iSuccessCount: int = 0
             for pszDroppedFilePath in listDroppedFilePaths:
                 pszResult, pszResultMessage = run_product_code_selector_cmd(
@@ -432,6 +437,11 @@ def window_proc(iWindowHandle: int, iMessage: int, iWparam: int, iLparam: int) -
                 elif pszResult == "not_found":
                     listNotFoundFileNames.append(os.path.basename(pszDroppedFilePath))
                 else:
+                    if pszResult == "invalid_weight_category":
+                        listInvalidWeightFileNames.append(os.path.basename(pszDroppedFilePath))
+                        pszWeightCategoryMessage = pszResultMessage.split("\n", 1)[0].removeprefix(
+                            "Error: "
+                        )
                     objErrorPath: Path = get_result_base_path(
                         pszDroppedFilePath
                     ).with_name(
@@ -462,6 +472,11 @@ def window_proc(iWindowHandle: int, iMessage: int, iWparam: int, iLparam: int) -
                 pszMessage += "\n\n失敗:\n" + format_limited_file_names(
                     listFailedFileNames
                 )
+                if listInvalidWeightFileNames:
+                    pszMessage += (
+                        "\n\n" + pszWeightCategoryMessage + "\n"
+                        + format_limited_file_names(listInvalidWeightFileNames)
+                    )
                 if listCancelledFileNames:
                     pszMessage += "\n\nキャンセル:\n" + format_limited_file_names(
                         listCancelledFileNames

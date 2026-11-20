@@ -47,6 +47,7 @@ STEP_HEADERS: tuple[str, ...] = (
 )
 WEEKDAYS: tuple[str, ...] = ("月", "火", "水", "木", "金", "土", "日")
 SUPPORTED_EXTENSIONS: set[str] = {".xlsx", ".tsv"}
+INVALID_WEIGHT_CATEGORY_EXIT_CODE: int = 4
 STEP0007_MARKER: str = "_step0007_"
 OUTPUT_PREFIX: str = "ProductCodeSelector_step0001_"
 SOURCE_PRODUCTS_FILE_NAME: str = "products_all_109_readable.tsv"
@@ -274,6 +275,10 @@ class SelectionCancelledError(Exception):
 
 class NoMatchingProductError(Exception):
     """担当者が商品マスターに該当商品なしと判断したことを表します。"""
+
+
+class InvalidWeightCategoryError(ValueError):
+    """入力ExcelのA1に有効な重量区分がないことを表します。"""
 
 
 class ProductCandidate:
@@ -2505,8 +2510,10 @@ def set_cell_value_in_worksheet_xml(
     iAreaEndRow: int,
     iCellXfsCount: int,
     tupleStyleAreaRanges: tuple[tuple[str, int, int, int, int], ...] | None = None,
+    *,
+    bInheritStyle: bool = False,
 ) -> bytes:
-    """既存セルを更新し、値がある未作成セルは同列の書式で挿入します。"""
+    """既存セルを更新し、値がある未作成セルは指定の書式で挿入します。"""
     bytesReference: bytes = re.escape(pszCellReference.encode("ascii"))
     objCellPattern: re.Pattern[bytes] = re.compile(
         rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?c\b"
@@ -2531,6 +2538,7 @@ def set_cell_value_in_worksheet_xml(
             iAreaEndRow,
             iCellXfsCount,
             tupleStyleAreaRanges,
+            bInheritStyle=bInheritStyle,
         )
     iStart, iEnd, bytesPrefix = get_cell_xml_span(bytesWorksheet, pszCellReference)
     bytesOriginalCell: bytes = bytesWorksheet[iStart:iEnd]
@@ -2830,8 +2838,10 @@ def insert_cell_value_in_worksheet_xml(
     iAreaEndRow: int,
     iCellXfsCount: int,
     tupleStyleAreaRanges: tuple[tuple[str, int, int, int, int], ...] | None = None,
+    *,
+    bInheritStyle: bool = False,
 ) -> bytes:
-    """存在しないセルを対象行の列順へ、近傍セルのs属性付きで挿入します。"""
+    """存在しないセルを対象行の列順に挿入します。"""
     objReferenceMatch: re.Match[str] | None = re.fullmatch(
         r"([A-Z]+)(\d+)", pszCellReference
     )
@@ -2839,71 +2849,40 @@ def insert_cell_value_in_worksheet_xml(
         raise ValueError("新規作成するセル参照が不正です。セル = " + pszCellReference)
     pszColumnLetters: str = objReferenceMatch.group(1)
     iTargetRow: int = int(objReferenceMatch.group(2))
-    bytesPrefix, bytesStyle = get_cell_style_for_new_cell(
-        bytesWorksheet,
-        pszColumnLetters,
-        iTargetRow,
-        iAreaStartRow,
-        iAreaEndRow,
-        iCellXfsCount,
-        tupleStyleAreaRanges,
-    )
+    if bInheritStyle:
+        bytesPrefix = get_worksheet_xml_prefix(bytesWorksheet)
+        bytesStyleAttribute = b""
+    else:
+        bytesPrefix, bytesStyle = get_cell_style_for_new_cell(
+            bytesWorksheet,
+            pszColumnLetters,
+            iTargetRow,
+            iAreaStartRow,
+            iAreaEndRow,
+            iCellXfsCount,
+            tupleStyleAreaRanges,
+        )
+        bytesStyleAttribute = b' s="' + bytesStyle + b'"'
     bytesRowNumber: bytes = re.escape(str(iTargetRow).encode("ascii"))
     objRowPattern: re.Pattern[bytes] = re.compile(
         rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?row\b"
         rb"[^<>]*\br\s*=\s*(?P<quote>[\"'])" + bytesRowNumber + rb"(?P=quote)[^<>]*>"
     )
     listRowMatches: list[re.Match[bytes]] = list(objRowPattern.finditer(bytesWorksheet))
-    if len(listRowMatches) != 1:
+    if len(listRowMatches) != 1 and (listRowMatches or not bInheritStyle):
         raise ValueError(
             "「センター週間」シートの"
             + str(iTargetRow)
             + "行目のXML要素を1つに特定できません。セル = "
             + pszCellReference
         )
-    objRowMatch: re.Match[bytes] = listRowMatches[0]
-    bytesRowPrefix: bytes = objRowMatch.group("prefix") or b""
-    objRowClosingMatch: re.Match[bytes] | None = re.search(
-        rb"</" + re.escape(bytesRowPrefix) + rb"row\s*>",
-        bytesWorksheet[objRowMatch.end() :],
-    )
-    if objRowClosingMatch is None:
-        raise ValueError(
-            "「センター週間」シートの"
-            + str(iTargetRow)
-            + "行目のXML終了要素がありません。"
-        )
-    iRowEnd: int = objRowMatch.end() + objRowClosingMatch.start()
-    iTargetColumn: int = 0
-    for pszCharacter in pszColumnLetters:
-        iTargetColumn = iTargetColumn * 26 + ord(pszCharacter) - ord("A") + 1
-    objAnyCellPattern: re.Pattern[bytes] = re.compile(
-        rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?c\b"
-        rb"[^<>]*\br\s*=\s*([\"'])(?P<reference>[A-Z]+\d+)\2[^<>]*(?:/?)>"
-    )
-    iInsertionPoint: int = iRowEnd
-    for objCellMatch in objAnyCellPattern.finditer(
-        bytesWorksheet, objRowMatch.end(), iRowEnd
-    ):
-        objCellReferenceMatch: re.Match[bytes] | None = re.fullmatch(
-            rb"([A-Z]+)(\d+)", objCellMatch.group("reference")
-        )
-        if objCellReferenceMatch is None:
-            continue
-        iCellColumn: int = 0
-        for iCharacter in objCellReferenceMatch.group(1):
-            iCellColumn = iCellColumn * 26 + iCharacter - ord("A") + 1
-        if iCellColumn > iTargetColumn:
-            iInsertionPoint = objCellMatch.start()
-            break
     bytesCellStart: bytes = (
         b"<"
         + bytesPrefix
         + b'c r="'
         + pszCellReference.encode("ascii")
-        + b'" s="'
-        + bytesStyle
         + b'"'
+        + bytesStyleAttribute
     )
     if bNumeric:
         bytesNewCell: bytes = (
@@ -2938,6 +2917,74 @@ def insert_cell_value_in_worksheet_xml(
             + bytesPrefix
             + b"c>"
         )
+    if not listRowMatches:
+        objNextRowPattern = re.compile(
+            rb"<(?:[A-Za-z_][\w.-]*:)?row\b[^<>]*\br\s*=\s*([\"'])(\d+)\1[^<>]*>"
+        )
+        objNextRow = next(
+            (
+                objRow
+                for objRow in objNextRowPattern.finditer(bytesWorksheet)
+                if int(objRow.group(2)) > iTargetRow
+            ),
+            None,
+        )
+        if objNextRow is None:
+            raise ValueError(
+                "セルを挿入する行の位置を特定できません。セル = " + pszCellReference
+            )
+        iInsertionPoint = objNextRow.start()
+        bytesNewRow = (
+            b"<" + bytesPrefix + b'row r="' + str(iTargetRow).encode("ascii") + b'">'
+            + bytesNewCell + b"</" + bytesPrefix + b"row>"
+        )
+        return (
+            bytesWorksheet[:iInsertionPoint]
+            + bytesNewRow
+            + bytesWorksheet[iInsertionPoint:]
+        )
+
+    objRowMatch: re.Match[bytes] = listRowMatches[0]
+    bytesRowPrefix: bytes = objRowMatch.group("prefix") or b""
+    if bInheritStyle and objRowMatch.group().endswith(b"/>"):
+        return (
+            bytesWorksheet[: objRowMatch.end() - 2]
+            + b">" + bytesNewCell + b"</" + bytesRowPrefix + b"row>"
+            + bytesWorksheet[objRowMatch.end() :]
+        )
+    objRowClosingMatch: re.Match[bytes] | None = re.search(
+        rb"</" + re.escape(bytesRowPrefix) + rb"row\s*>",
+        bytesWorksheet[objRowMatch.end() :],
+    )
+    if objRowClosingMatch is None:
+        raise ValueError(
+            "「センター週間」シートの"
+            + str(iTargetRow)
+            + "行目のXML終了要素がありません。"
+        )
+    iRowEnd: int = objRowMatch.end() + objRowClosingMatch.start()
+    iTargetColumn: int = 0
+    for pszCharacter in pszColumnLetters:
+        iTargetColumn = iTargetColumn * 26 + ord(pszCharacter) - ord("A") + 1
+    objAnyCellPattern: re.Pattern[bytes] = re.compile(
+        rb"<(?P<prefix>[A-Za-z_][\w.-]*:)?c\b"
+        rb"[^<>]*\br\s*=\s*([\"'])(?P<reference>[A-Z]+\d+)\2[^<>]*(?:/?)>"
+    )
+    iInsertionPoint: int = iRowEnd
+    for objCellMatch in objAnyCellPattern.finditer(
+        bytesWorksheet, objRowMatch.end(), iRowEnd
+    ):
+        objCellReferenceMatch: re.Match[bytes] | None = re.fullmatch(
+            rb"([A-Z]+)(\d+)", objCellMatch.group("reference")
+        )
+        if objCellReferenceMatch is None:
+            continue
+        iCellColumn: int = 0
+        for iCharacter in objCellReferenceMatch.group(1):
+            iCellColumn = iCellColumn * 26 + iCharacter - ord("A") + 1
+        if iCellColumn > iTargetColumn:
+            iInsertionPoint = objCellMatch.start()
+            break
     return (
         bytesWorksheet[:iInsertionPoint]
         + bytesNewCell
@@ -3815,6 +3862,17 @@ def update_step0005_cells_in_worksheet_xml(
             pszCellReference,
             (objTargetDate - objExcelEpoch).days,
         )
+    if (7, 10) in dictDetailCells:
+        bytesWorksheet = set_cell_value_in_worksheet_xml(
+            bytesWorksheet,
+            "J7",
+            str(dictDetailCells[(7, 10)]),
+            bNumeric=False,
+            iAreaStartRow=7,
+            iAreaEndRow=7,
+            iCellXfsCount=iCellXfsCount,
+            bInheritStyle=True,
+        )
     bytesWorksheet = set_cell_value_in_worksheet_xml(
         bytesWorksheet,
         "K9",
@@ -4015,6 +4073,7 @@ def create_step0005_outputs(
     bFourColumn: bool = False,
     *,
     objStep0002TsvPath: Path,
+    pszWeightCategory: str = "",
 ) -> list[tuple[Path, Path]]:
     """通常版または分割版step0004から月～日の鮮魚明細票を一括作成します。"""
     if not objStep0002TsvPath.is_file():
@@ -4174,6 +4233,8 @@ def create_step0005_outputs(
                     bDoubleHiroshima,
                 )
                 dictDetailCells[(9, 11)] = pszSelectedProductName
+                if pszWeightCategory:
+                    dictDetailCells[(7, 10)] = pszWeightCategory
                 dictDetailCells.update(
                     build_step0005_summary_cells(
                         listHiroshimaOrders,
@@ -4276,6 +4337,11 @@ def create_step0005_outputs(
                             "step0005 XLSXのシート名・順番・表示状態が変更されました。"
                         )
                     objSavedWorksheet = objSavedWorkbook[FRESH_FISH_TEMPLATE_SHEET_NAME]
+                    if (
+                        pszWeightCategory
+                        and objSavedWorksheet["J7"].value != pszWeightCategory
+                    ):
+                        raise ValueError("step0005 XLSXのJ7が入力ExcelのA1の重量区分と一致しません。")
                     if objSavedWorksheet["K9"].value != pszSelectedProductName:
                         raise ValueError("step0005 XLSXのK9がstep0002 F3の商品名と一致しません。")
                     for pszCell, objExpectedDate in (
@@ -4644,10 +4710,20 @@ def process_input_file(
 ]:
     """step0007からstep0001～step0005を順に作成します。"""
     objInputPath: Path = validate_input_path(pszInputFileFullPath)
-    create_abc_product_master(get_source_products_file_path(), get_products_file_path())
+    pszWeightCategory: str = ""
     if objInputPath.suffix.lower() == ".xlsx":
         listRows, pszWorksheetTitle = read_excel_table(objInputPath)
+        pszWeightCategory = listRows[0][0].strip()
+        if pszWeightCategory not in ("定貫", "不定貫"):
+            raise InvalidWeightCategoryError(
+                "入力ExcelのA1に「定貫」または「不定貫」を入力し、"
+                "保存してから再度ドラッグ＆ドロップしてください。"
+            )
+        # 重量区分はstep0005にだけ引き継ぎ、従来の注文データのA1は空欄にします。
+        listRows[0][0] = ""
+        create_abc_product_master(get_source_products_file_path(), get_products_file_path())
     else:
+        create_abc_product_master(get_source_products_file_path(), get_products_file_path())
         listRows, pszWorksheetTitle = read_tsv_table(objInputPath)
     listRows = normalize_product_code_columns(listRows)
     validate_step0007_table(listRows)
@@ -4758,6 +4834,7 @@ def process_input_file(
                 objStep0004TsvPath,
                 (tupleStoreOrderPaths[1], tupleStoreOrderPaths[2], tupleStoreOrderPaths[3]),
                 objStep0002TsvPath=objStep0002TsvPath,
+                pszWeightCategory=pszWeightCategory,
             )
         except Exception as objException:
             write_step0005_error(objStep0004TsvPath, str(objException))
@@ -4787,6 +4864,7 @@ def process_input_file(
                 (tupleStoreOrderPaths[1], tupleStoreOrderPaths[2], tupleStoreOrderPaths[3]),
                 bFourColumn=True,
                 objStep0002TsvPath=objStep0002TsvPath,
+                pszWeightCategory=pszWeightCategory,
             )
         except Exception as objException:
             write_step0005_error(objH4t, str(objException))
@@ -4817,7 +4895,7 @@ def parse_command_line_arguments() -> str:
 
 
 def main() -> int:
-    """成功0・失敗1・キャンセル2・該当商品なし3の終了コードを返します。"""
+    """成功0・失敗1・キャンセル2・該当商品なし3・重量区分不正4を返します。"""
     configure_standard_streams()
     try:
         pszInputFileFullPath: str = parse_command_line_arguments()
@@ -4882,6 +4960,8 @@ def main() -> int:
                 + str(objWriteException),
                 file=sys.stderr,
             )
+        if isinstance(objException, InvalidWeightCategoryError):
+            return INVALID_WEIGHT_CATEGORY_EXIT_CODE
         return 1
     print("ProductCodeSelector step0001～step0005の作成が完了しました。")
     print("商品名: " + pszProductName)
