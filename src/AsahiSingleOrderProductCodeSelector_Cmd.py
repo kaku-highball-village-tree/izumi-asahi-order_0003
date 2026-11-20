@@ -68,6 +68,7 @@ FRESH_FISH_DOUBLE_TEMPLATE_FILE_NAME: str = (
 FRESH_FISH_OUTPUT_SUFFIX: str = "_鮮魚_店別納入明細票"
 FRESH_FISH_SHEET_NAME: str = "センター週間"
 FRESH_FISH_TEMPLATE_SHEET_NAME: str = "店別納入明細票"
+FRESH_FISH_FIXED_WEIGHT_MARK: str = "－"
 FRESH_FISH_MAX_ROW: int = 60
 FRESH_FISH_MAX_COLUMN: int = 13
 FRESH_FISH_CLEAR_RANGES: tuple[str, ...] = ("B14:E53", "F14:I53", "J14:M53")
@@ -3728,8 +3729,10 @@ def build_step0005_detail_cells(
     listOkayamaOrders: list[tuple[str, str, int | float]],
     listShikokuOrders: list[tuple[str, str, int | float]],
     bDoubleHiroshima: bool,
+    *,
+    bFixedWeight: bool = False,
 ) -> dict[tuple[int, int], str | int | float]:
-    """数量を目方重量1と0.5へ分け、選択テンプレート用セルを返します。"""
+    """注文あり店舗ごとに2行の明細を作成し、定貫の目方重量欄に「－」を設定します。"""
     dictCells: dict[tuple[int, int], str | int | float] = {}
 
     def add_orders(
@@ -3747,7 +3750,9 @@ def build_step0005_detail_cells(
                 dictCells[(iRow, iStartColumn)] = pszCode
                 dictCells[(iRow, iStartColumn + 1)] = pszName
                 dictCells[(iRow, iStartColumn + 2)] = iDeliveryQuantity
-                dictCells[(iRow, iStartColumn + 3)] = objWeight
+                dictCells[(iRow, iStartColumn + 3)] = (
+                    FRESH_FISH_FIXED_WEIGHT_MARK if bFixedWeight else objWeight
+                )
 
     iHiroshimaCapacity = (
         FRESH_FISH_HIROSHIMA_PAGE_CAPACITY
@@ -3890,7 +3895,11 @@ def update_step0005_cells_in_worksheet_xml(
                 bytesWorksheet,
                 get_column_letter(iColumn) + str(iRow),
                 pszValue,
-                bNumeric=bool(pszValue) and iColumn in (4, 5, 8, 9, 12, 13),
+                bNumeric=(
+                    bool(pszValue)
+                    and objValue != FRESH_FISH_FIXED_WEIGHT_MARK
+                    and iColumn in (4, 5, 8, 9, 12, 13)
+                ),
                 iAreaStartRow=FRESH_FISH_DETAIL_START_ROW,
                 iAreaEndRow=FRESH_FISH_DETAIL_END_ROW,
                 iCellXfsCount=iCellXfsCount,
@@ -4231,6 +4240,7 @@ def create_step0005_outputs(
                     listOkayamaOrders if iPage == 1 else [],
                     listShikokuOrders if iPage == 1 else [],
                     bDoubleHiroshima,
+                    bFixedWeight=pszWeightCategory == "定貫",
                 )
                 dictDetailCells[(9, 11)] = pszSelectedProductName
                 if pszWeightCategory:
